@@ -2,7 +2,7 @@
 {% if files %}
 <p>The repository contains {{ files|length }} TODO.md file(s):</p>
 {% for f in files %}
-<div class="todo-md-file" id="md-{{ f.tid }}" style="--bgc:#f0f8ff; --p:15px; --mb:15px; --radius:5px; --bl:4px solid #007bff; --shadow:6">
+<div class="todo-md-file{% if f.hidden_by %} td-hidden{% endif %}" id="md-{{ f.tid }}" style="--bgc:#f0f8ff; --p:15px; --mb:15px; --radius:5px; --bl:4px solid #007bff; --shadow:6">
     <div class="file-path" style="--weight:bold; --c:#333; --mb:10px">{{ f.file_path }}<a
             data-editor-link="1" data-file-path="{{ f.file_path }}" data-line-num=""
             target="_blank" rel="noopener noreferrer"

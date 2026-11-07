@@ -8,8 +8,7 @@ The theme: **verify before you trust.** Most of the costly problems looked fine 
 
 Read the region you will touch, not just a grep.
 
-Always check whether anyone else is working in the repo. Run `git status` before and after your edits. If a anyone has staged work in flight, never `git add -A` — name your files explicitly. (2026-08-16: a collaborator had `todoscope.spec`
-staged across four of my commits; naming files kept it intact.)
+Always check whether anyone else is working in the repo. Run `git status` before and after your edits. If a anyone has staged work in flight, never `git add -A` — name your files explicitly. (2026-08-16: a collaborator had `todoscope.spec` staged across four of my commits; naming files kept it intact.)
 
 For any file that might be hardlinked — Makefiles especially — check first:
 

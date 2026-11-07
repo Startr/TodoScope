@@ -111,7 +111,8 @@ Event types (`data:` lines, JSON):
 | `todos_list` | `count`, `html` fragment (full list) |
 | `todo` | `count`, `html` fragment (one item, full-scan path only) |
 | `kanban` | `html` fragment; may arrive twice (pre- and post-blame), plus an instant stale board from the cached canvas |
-| `excluded` | `items` — paths skipped via `.todoscope-exclude.csv` |
+| `scope` | `rules` — every `.todoscope-exclude.csv` row as `{path, reason, mode}`; `hash` — the file's hash, sent back by the scope editor. Also pushed on `/events/` after each live rescan |
+| `excluded` | `items` — files skipped by exclude rules. Directory rules prune the walk and are not listed |
 | `complete` | `count`, `repo_name`, `source` (`local` or `cloned`) |
 | `error` | `message` |
 
@@ -204,6 +205,40 @@ Errors:
 
 The write itself triggers the watchdog, which rescans and pushes fresh fragments
 to every `/events/` subscriber.
+
+### `POST /api/scope/<repo_name>`
+
+Replace a repo's `.todoscope-exclude.csv` from the board's scope editor.
+**Registered local repos only.**
+
+Request:
+
+```json
+{"base_hash": "e4573901e365",
+ "rules": [{"path": "build", "reason": "Generated output", "mode": "exclude"},
+           {"path": "charts", "reason": "Navigation plans", "mode": "hide"}]}
+```
+
+`base_hash` is the `hash` from the last `scope` event. A mismatch means the
+file changed since the viewer loaded it; the write is refused and the body
+carries the current rules. Paths are normalised (`./` and trailing `/`
+stripped) and must stay relative to the repo root. The file keeps two
+columns unless a rule uses `hide`.
+
+Success: `{"ok": true, "type": "scope", "rules": [...], "hash": "..."}`
+
+Errors:
+
+| Status | Body | Cause |
+| --- | --- | --- |
+| 403 | `{"error": "Scope editing is only available for registered local repositories"}` | Repo not registered local |
+| 409 | `{"error": ".todoscope-exclude.csv changed since you loaded it", "rules": [...], "hash": "..."}` | Stale view |
+| 400 | `{"error": "..."}` | Empty, absolute, `..` or duplicate path; unknown mode; over 500 rules |
+| 500 | `{"error": "Cannot write .todoscope-exclude.csv: ..."}` | Write failed |
+
+Like checkbox write-back, the write triggers the watchdog, which rescans and
+pushes fresh fragments to every `/events/` subscriber. Hide rules never
+invalidate the incremental-scan cache; exclude rules do.
 
 ### `POST /api/webhook/<repo_name>`
 

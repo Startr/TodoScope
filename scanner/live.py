@@ -196,7 +196,8 @@ def _repo_lock(repo_name):
 
 def _rescan_and_publish(repo_name, repo_path):
     """Incremental rescan → fragments → publish. Serialized per repo."""
-    from .app import (app, load_exclusions, find_todo_files, find_todos,
+    from .app import (app, load_scope_rules, split_scope, scope_event,
+                      find_todo_files, find_todos,
                       load_scan_state, save_scan_state, _git_head_sha,
                       exclusions_hash, git_changed_paths, rescan_files,
                       collect_blame_data, TodoItem, SCAN_STATE_SCHEMA)
@@ -209,8 +210,9 @@ def _rescan_and_publish(repo_name, repo_path):
         return  # a rescan is already running; the watcher will re-fire if needed
     try:
         with app.app_context():
-            exclusions = load_exclusions(repo_path)
-            todo_md_files = find_todo_files(repo_path, exclusions=exclusions)
+            exclusions, hidden = split_scope(load_scope_rules(repo_path))
+            skipped = []
+            todo_md_files = find_todo_files(repo_path, exclusions=exclusions, skipped=skipped)
             state = load_scan_state(repo_name)
             current_head = _git_head_sha(repo_path)
             exc_hash = exclusions_hash(exclusions)
@@ -229,7 +231,7 @@ def _rescan_and_publish(repo_name, repo_path):
                         todos_collected.append(TodoItem(
                             rel_path, item['line_num'], item['todo_text'], item['next_line']))
             else:
-                todos_collected = list(find_todos(repo_path, exclusions=exclusions))
+                todos_collected = list(find_todos(repo_path, exclusions=exclusions, skipped=skipped))
 
             canvas, cards = build_kanban(todo_md_files, todos_collected)
             write_canvas(repo_path, canvas)
@@ -254,19 +256,23 @@ def _rescan_and_publish(repo_name, repo_path):
 
             todo_dicts = [t.to_dict() for t in todos_collected]
             md_sources = {f['file_path']: f['content'] for f in todo_md_files if f.get('content')}
+            publish(repo_name, scope_event(repo_path))
+            if changed is None:  # full scan — the excluded list is complete
+                publish(repo_name, {'type': 'excluded', 'items': skipped})
             publish(repo_name, {
                 'type': 'kanban',
-                'html': fragments.render_kanban_html(canvas, blame_data, md_sources=md_sources),
+                'html': fragments.render_kanban_html(canvas, blame_data, md_sources=md_sources,
+                                                     hidden=hidden),
             })
             publish(repo_name, {
                 'type': 'todo_md_files',
                 'count': len(todo_md_files),
-                'html': fragments.render_todo_md_files_html(todo_md_files),
+                'html': fragments.render_todo_md_files_html(todo_md_files, hidden=hidden),
             })
             publish(repo_name, {
                 'type': 'todos_list',
                 'count': len(todo_dicts),
-                'html': fragments.render_todos_list_html(todo_dicts, blame_data),
+                'html': fragments.render_todos_list_html(todo_dicts, blame_data, hidden=hidden),
             })
     except Exception as e:
         from .app import app as _app

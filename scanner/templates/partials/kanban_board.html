@@ -3,9 +3,9 @@
 <div id="kanban-board" class="kanban-board{% if stale %} kanban-stale{% endif %}">
     {% for col in columns %}
     <div class="kanban-column {{ col.color_class }}">
-        <div class="kanban-column-header">{{ col.label }} <span class="kanban-column-count">{{ col.cards|length }}</span></div>
+        <div class="kanban-column-header">{{ col.label }} <span class="kanban-column-count">{{ col.visible_count }}{% if col.hidden_count %}<span class="td-hidden"> +{{ col.hidden_count }} hidden</span>{% endif %}</span></div>
         {% for card in col.cards %}
-        <div class="kanban-card{% if card.inline %} kanban-card-inline{% endif %}" id="card-{{ card.id }}">
+        <div class="kanban-card{% if card.inline %} kanban-card-inline{% endif %}{% if card.hidden_by %} td-hidden{% endif %}" id="card-{{ card.id }}"{% if card.hidden_by %} title="Hidden by {{ card.hidden_by.path }}{% if card.hidden_by.reason %} — {{ card.hidden_by.reason }}{% endif %}"{% endif %}>
             {{ card.html }}
             {% if card.file_path and card.line_num %}
             <span class="card-location">

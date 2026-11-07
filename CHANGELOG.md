@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Internal checkpoints use a 4-segment scheme (e.g. `v1.0.0.1`) and are not
 listed here — only public releases.
 
+## [Unreleased]
+
+### Added
+- `.todoscope-exclude.csv` takes an optional `mode` column. `hide` scans a
+  path but folds its cards behind a per-viewer *Show hidden* toggle;
+  `exclude` (the default) keeps the old behaviour.
+- *Scan scope* panel on the board: lists the rules and, on local repos,
+  edits them in place (`POST /api/scope/<repo>`, hash-guarded).
+
+### Fixed
+- The excluded-paths list rendered repo-supplied paths and reasons as HTML.
+  It now renders them as text.
+
 ## [1.0.0] — 2026-05-03
 
 First official release. TodoScope ships as a Mac app, standalone binaries

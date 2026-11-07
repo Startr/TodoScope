@@ -197,6 +197,47 @@
         color: #999;
         font-size: 0.9em;
     }
+    /* Scope: hide-mode cards fold away until the viewer asks to see them */
+    body:not(.td-show-hidden) .td-hidden { display: none !important; }
+    .td-show-hidden .kanban-card.td-hidden,
+    .td-show-hidden .todo-item.td-hidden,
+    .td-show-hidden .todo-md-file.td-hidden { opacity: 0.55; border-style: dashed; }
+    .scope-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+        padding: 6px 0;
+        border-bottom: 1px solid #f0e080;
+        font-size: 0.9em;
+    }
+    .scope-row input, .scope-row select {
+        padding: 3px 6px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 1em;
+        background: #fff;
+    }
+    .scope-row .scope-path { font-family: monospace; flex: 1 1 12rem; min-width: 0; }
+    .scope-row .scope-reason { flex: 2 1 16rem; min-width: 0; }
+    .scope-mode-badge {
+        font-size: 0.8em;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: #ffe0b2;
+        color: #7a3c00;
+    }
+    .scope-mode-badge.mode-hide { background: #e1f5fe; color: #01579b; }
+    .scope-actions button {
+        padding: 5px 12px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+        cursor: pointer;
+        font-size: 0.9em;
+    }
+    .scope-actions button.primary { background: #4CAF50; border-color: #4CAF50; color: #fff; }
+    .scope-actions button:disabled { opacity: 0.5; cursor: default; }
     .editor-custom-input {
         padding: 3px 6px;
         border: 1px solid #ccc;
@@ -257,6 +298,9 @@
     <div id="kanban-container" style="display:none">
         <div style="--d:flex; --jc:space-between; --ai:baseline; --fw:wrap; gap:8px">
             <h2 class="section-title" style="--mb:0">Kanban Board</h2>
+            <label class="editor-selector" id="hidden-toggle" style="display:none" title="Cards under paths marked hide in Scan scope">
+                <input type="checkbox" id="show-hidden"> Show <span id="hidden-count">0</span> hidden
+            </label>
             <div class="editor-selector" id="editor-selector">
                 <span class="editor-label">Open in:</span>
                 <select id="editor-mode" title="Choose where file links open">
@@ -280,12 +324,27 @@
         <div id="todo-md-files"></div>
     </div>
 
-    <div id="excluded-container" style="display:none; --mt:20px">
-        <details style="--bgc:#fff8e1; --p:15px; --radius:5px; --b:1px solid #f0c040">
-            <summary style="--cur:pointer; --weight:bold; --c:#7a5c00">
-                <span id="excluded-count">0</span> path(s) excluded from scan — click to see why
-            </summary>
-            <div id="excluded-list" style="--mt:10px"></div>
+    <div id="scope-container" style="display:none; --mt:20px">
+        <details id="scope-details" style="--bgc:#fff8e1; --p:15px; --radius:5px; --b:1px solid #f0c040">
+            <summary style="--cur:pointer; --weight:bold; --c:#7a5c00" id="scope-summary">Scan scope</summary>
+            <p style="--size:0.85em; --c:#666; --mt:8px">
+                Rules from <code>.todoscope-exclude.csv</code>. <strong>Exclude</strong> skips a path entirely.
+                <strong>Hide</strong> still scans it, but folds its cards away until you tick <em>Show hidden</em>.
+                A path matches its whole subtree; globs such as <code>*.min.js</code> work too.
+            </p>
+            <div id="scope-rules"></div>
+            <div id="scope-actions" class="scope-actions" style="display:none; --mt:10px; --d:flex; --fw:wrap; --ai:center; gap:8px">
+                <button type="button" id="scope-add">Add rule</button>
+                <button type="button" id="scope-save" class="primary" disabled>Save to .todoscope-exclude.csv</button>
+                <button type="button" id="scope-revert" disabled>Revert</button>
+                <span id="scope-msg" style="--size:0.85em; --c:#666"></span>
+            </div>
+            <details id="excluded-details" style="display:none; --mt:12px">
+                <summary style="--cur:pointer; --size:0.9em; --c:#7a5c00">
+                    <span id="excluded-count">0</span> path(s) skipped by exclude rules
+                </summary>
+                <div id="excluded-list" style="--mt:6px"></div>
+            </details>
         </details>
     </div>
 
@@ -408,6 +467,26 @@
                 Idiomorph.morph(el, html, { morphStyle: 'innerHTML' });
                 reRenderLinks(el);
                 enableWriteback(el);
+                updateHiddenToggle();
+            }
+
+            // --- Hidden cards (hide-mode scope rules) ---
+            // The server marks them .td-hidden; this per-viewer toggle unfolds them.
+            const showHiddenEl = document.getElementById('show-hidden');
+            const hiddenToggleEl = document.getElementById('hidden-toggle');
+            function showHiddenKey() { return `todoScope-showHidden:${currentRepo || ''}`; }
+            function applyShowHidden(on) {
+                document.body.classList.toggle('td-show-hidden', on);
+                showHiddenEl.checked = on;
+            }
+            showHiddenEl.addEventListener('change', function() {
+                applyShowHidden(this.checked);
+                try { localStorage.setItem(showHiddenKey(), this.checked ? '1' : ''); } catch (e) {}
+            });
+            function updateHiddenToggle() {
+                const n = kanbanLive.querySelectorAll('.kanban-card.td-hidden').length;
+                document.getElementById('hidden-count').textContent = n;
+                hiddenToggleEl.style.display = n > 0 ? '' : 'none';
             }
 
             // --- Checkbox write-back (authed views of local repos only) ---
@@ -442,7 +521,110 @@
                 }).catch(() => { cb.checked = !cb.checked; });
             });
 
-            // Shared dispatcher — the initial scan stream and the persistent
+            // --- Scan scope editor (authed views of local repos only) ---
+            // The server sends the rules as a 'scope' event; Save posts the whole
+            // list back with the hash it was loaded from, so an edit made
+            // elsewhere is refused (409) rather than overwritten.
+            const scopeRulesEl = document.getElementById('scope-rules');
+            const scopeSaveEl = document.getElementById('scope-save');
+            const scopeRevertEl = document.getElementById('scope-revert');
+            const scopeMsgEl = document.getElementById('scope-msg');
+            let scope = { rules: [], hash: '' };
+            let scopeDirty = false;
+            let scopeEditable = false;  // set once the live channel is up
+
+            function el(tag, props, children) {
+                const node = Object.assign(document.createElement(tag), props || {});
+                (children || []).forEach(c => node.append(c));
+                return node;
+            }
+
+            function scopeRow(rule) {
+                if (!scopeEditable) {
+                    return el('div', { className: 'scope-row' }, [
+                        el('code', { textContent: rule.path, style: 'color:#333' }),
+                        el('span', { className: `scope-mode-badge mode-${rule.mode}`, textContent: rule.mode }),
+                        el('span', { textContent: rule.reason || '', style: 'color:#666' }),
+                    ]);
+                }
+                const mode = el('select', { className: 'scope-mode', title: 'Exclude: never scanned. Hide: scanned, folded away.' }, [
+                    el('option', { value: 'exclude', textContent: 'Exclude' }),
+                    el('option', { value: 'hide', textContent: 'Hide' }),
+                ]);
+                mode.value = rule.mode;
+                const remove = el('button', { type: 'button', className: 'scope-remove', textContent: '✕', title: 'Remove rule' });
+                remove.addEventListener('click', () => { remove.closest('.scope-row').remove(); markScopeDirty(); });
+                return el('div', { className: 'scope-row' }, [
+                    el('input', { className: 'scope-path', value: rule.path, placeholder: 'path/or/glob*', ariaLabel: 'Path' }),
+                    mode,
+                    el('input', { className: 'scope-reason', value: rule.reason || '', placeholder: 'Why (optional)', ariaLabel: 'Reason' }),
+                    remove,
+                ]);
+            }
+
+            function renderScope() {
+                const n = scope.rules.length;
+                const hidden = scope.rules.filter(r => r.mode === 'hide').length;
+                document.getElementById('scope-summary').textContent = n === 0
+                    ? 'Scan scope — every file is scanned'
+                    : `Scan scope — ${n - hidden} excluded, ${hidden} hidden`;
+                scopeRulesEl.replaceChildren(...scope.rules.map(scopeRow));
+                document.getElementById('scope-actions').style.display = scopeEditable ? 'flex' : 'none';
+                document.getElementById('scope-container').style.display = (n > 0 || scopeEditable) ? 'block' : 'none';
+                scopeDirty = false;
+                scopeSaveEl.disabled = scopeRevertEl.disabled = true;
+            }
+
+            function markScopeDirty() {
+                scopeDirty = true;
+                scopeSaveEl.disabled = scopeRevertEl.disabled = false;
+                scopeMsgEl.textContent = 'Unsaved changes';
+            }
+            scopeRulesEl.addEventListener('input', markScopeDirty);
+            scopeRulesEl.addEventListener('change', markScopeDirty);
+
+            document.getElementById('scope-add').addEventListener('click', function() {
+                const row = scopeRow({ path: '', reason: '', mode: 'hide' });
+                scopeRulesEl.append(row);
+                row.querySelector('.scope-path').focus();
+                markScopeDirty();
+            });
+            scopeRevertEl.addEventListener('click', function() {
+                renderScope();
+                scopeMsgEl.textContent = '';
+            });
+
+            scopeSaveEl.addEventListener('click', function() {
+                const rules = [...scopeRulesEl.querySelectorAll('.scope-row')].map(row => ({
+                    path: row.querySelector('.scope-path').value,
+                    mode: row.querySelector('.scope-mode').value,
+                    reason: row.querySelector('.scope-reason').value,
+                })).filter(r => r.path.trim() || r.reason.trim());
+                scopeSaveEl.disabled = true;
+                scopeMsgEl.textContent = 'Saving…';
+                fetch(`/api/scope/${encodeURIComponent(currentRepo)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ rules: rules, base_hash: scope.hash }),
+                }).then(r => r.json().then(body => ({ status: r.status, body: body })))
+                .then(({ status, body }) => {
+                    if (status === 200) {
+                        scope = { rules: body.rules, hash: body.hash };
+                        renderScope();
+                        scopeMsgEl.textContent = 'Saved — the board refreshes as the rescan lands.';
+                    } else if (status === 409) {
+                        scope = { rules: body.rules, hash: body.hash };
+                        renderScope();
+                        scopeMsgEl.textContent = 'The file changed on disk, so your edits were not saved. Showing the current rules.';
+                    } else {
+                        scopeSaveEl.disabled = false;
+                        scopeMsgEl.textContent = body.error || `Save failed (${status})`;
+                    }
+                }).catch(() => {
+                    scopeSaveEl.disabled = false;
+                    scopeMsgEl.textContent = 'Save failed — check the connection and try again.';
+                });
+            });
             // live channel speak the same event vocabulary.
             function handleEvent(data) {
                 switch(data.type) {
@@ -454,6 +636,7 @@
                         // Initialize the page with repository information
                         currentRepo = data.repo_name;
                         repoWritable = PAGE_AUTHED && !!data.local_path;
+                        try { applyShowHidden(localStorage.getItem(showHiddenKey()) === '1'); } catch (e) {}
                         repoNameEl.textContent = `Repository: ${data.repo_name}`;
                         repoUrlEl.textContent = `URL: ${data.repo_url}`;
                         // Backend supplies parsed host metadata + a file-URL template for any
@@ -520,20 +703,25 @@
                         }
                         break;
 
-                    case 'excluded':
-                        if (data.items && data.items.length > 0) {
-                            document.getElementById('excluded-count').textContent = data.items.length;
-                            document.getElementById('excluded-container').style.display = 'block';
-                            const excList = document.getElementById('excluded-list');
-                            data.items.forEach(item => {
-                                const row = document.createElement('div');
-                                row.style = '--p:6px 0; --bb:1px solid #f0e080; --size:0.9em';
-                                row.innerHTML = '<code style="--c:#333">' + item.path + '</code>'
-                                    + (item.reason ? ' — <span style="--c:#666">' + item.reason + '</span>' : '');
-                                excList.appendChild(row);
-                            });
-                        }
+                    case 'scope':
+                        // Live rescans resend the rules; never clobber an open edit.
+                        if (scopeDirty) break;
+                        scope = { rules: data.rules || [], hash: data.hash || '' };
+                        renderScope();
                         break;
+
+                    case 'excluded': {
+                        // Paths and reasons come from the repo — text only, never HTML.
+                        const items = data.items || [];
+                        document.getElementById('excluded-count').textContent = items.length;
+                        document.getElementById('excluded-details').style.display = items.length ? '' : 'none';
+                        document.getElementById('excluded-list').replaceChildren(...items.map(item =>
+                            el('div', { style: 'padding:6px 0; border-bottom:1px solid #f0e080; font-size:0.9em' }, [
+                                el('code', { textContent: item.path, style: 'color:#333' }),
+                                ...(item.reason ? [' — ', el('span', { textContent: item.reason, style: 'color:#666' })] : []),
+                            ])));
+                        break;
+                    }
 
                     case 'complete':
                         loadingEl.style.display = 'none';
@@ -575,6 +763,11 @@
                 live.onmessage = e => handleEvent(JSON.parse(e.data));
                 const msg = document.getElementById('rescan-msg');
                 if (msg) msg.textContent = 'Live — the board updates as files change.';
+                // Saving scope needs the watcher running so the rescan reaches this page
+                if (repoWritable && !scopeDirty) {
+                    scopeEditable = true;
+                    renderScope();
+                }
             }
         });
     </script>

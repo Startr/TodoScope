@@ -92,18 +92,28 @@ def highlight_todo(text):
     return Markup(_HIGHLIGHT_RE.sub(r'<span class="highlight">\1</span>', escaped))
 
 
+def _hidden_by(file_path, hidden):
+    """The hide rule covering file_path, or None. Hidden cards still render;
+    the board folds them behind its "show hidden" toggle."""
+    if not hidden or not file_path:
+        return None
+    from .app import is_excluded
+    return is_excluded(file_path, hidden)
+
+
 def _short_id(*parts):
     raw = ':'.join(str(p) for p in parts)
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
-def canvas_to_columns(canvas, blame=None, md_sources=None):
+def canvas_to_columns(canvas, blame=None, md_sources=None, hidden=None):
     """Assign JSON Canvas cards to their columns — mirrors the layout
     contract in kanban.generate_canvas (x-range containment, y order).
 
     md_sources: {file_path: content} of the scanned TODO files — used to
     stamp write-back attrs on card checkboxes (children carry line numbers;
-    the hash comes from the real source line)."""
+    the hash comes from the real source line).
+    hidden: hide-mode scope rules — matching cards are marked, not dropped."""
     if not canvas or not canvas.get('nodes'):
         return []
     blame = blame or {}
@@ -141,6 +151,7 @@ def canvas_to_columns(canvas, blame=None, md_sources=None):
                 html = _annotate_inputs(html, targets)
             col_cards.append({
                 'id': c.get('id') or _short_id(file_path, line_num, text),
+                'hidden_by': _hidden_by(file_path, hidden),
                 'html': html,
                 'inline': c.get('source') == 'inline',
                 'file_path': file_path,
@@ -148,21 +159,24 @@ def canvas_to_columns(canvas, blame=None, md_sources=None):
                 'author': author,
             })
         color = str(g.get('color')) if g.get('color') else None
+        n_hidden = sum(1 for c in col_cards if c['hidden_by'])
         columns.append({
             'label': g.get('label') or 'Untitled',
+            'visible_count': len(col_cards) - n_hidden,
+            'hidden_count': n_hidden,
             'color_class': f'kanban-col-{color}' if color in _COLOR_CLASSES else 'kanban-col-none',
             'cards': col_cards,
         })
     return columns
 
 
-def render_kanban_html(canvas, blame=None, stale=False, md_sources=None):
+def render_kanban_html(canvas, blame=None, stale=False, md_sources=None, hidden=None):
     return render_template('partials/kanban_board.html',
-                           columns=canvas_to_columns(canvas, blame, md_sources),
+                           columns=canvas_to_columns(canvas, blame, md_sources, hidden),
                            stale=stale)
 
 
-def _todo_item_ctx(todo_dict, blame=None):
+def _todo_item_ctx(todo_dict, blame=None, hidden=None):
     blame = blame or {}
     key = f"{todo_dict.get('file_path')}:{todo_dict.get('line_num')}"
     return {
@@ -170,19 +184,20 @@ def _todo_item_ctx(todo_dict, blame=None):
         'tid': _short_id(todo_dict.get('file_path'), todo_dict.get('line_num')),
         'highlighted': highlight_todo(todo_dict.get('todo_text')),
         'author': blame.get(key),
+        'hidden_by': _hidden_by(todo_dict.get('file_path'), hidden),
     }
 
 
-def render_todo_item_html(todo_dict, blame=None):
-    return render_template('partials/todo_item.html', **_todo_item_ctx(todo_dict, blame))
+def render_todo_item_html(todo_dict, blame=None, hidden=None):
+    return render_template('partials/todo_item.html', **_todo_item_ctx(todo_dict, blame, hidden))
 
 
-def render_todos_list_html(todo_dicts, blame=None):
-    items = [_todo_item_ctx(t, blame) for t in todo_dicts or []]
+def render_todos_list_html(todo_dicts, blame=None, hidden=None):
+    items = [_todo_item_ctx(t, blame, hidden) for t in todo_dicts or []]
     return render_template('partials/todos_list.html', items=items)
 
 
-def render_todo_md_files_html(files):
+def render_todo_md_files_html(files, hidden=None):
     rendered = []
     for f in files or []:
         content = f.get('content')
@@ -195,6 +210,7 @@ def render_todo_md_files_html(files):
         rendered.append({
             'tid': _short_id(f.get('file_path')),
             'file_path': f.get('file_path'),
+            'hidden_by': _hidden_by(f.get('file_path'), hidden),
             'html': html,
         })
     return render_template('partials/todo_md_files.html', files=rendered)

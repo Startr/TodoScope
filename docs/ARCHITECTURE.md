@@ -249,7 +249,9 @@ Without it (dev checkout, Docker) the same files live under `scanner/`
 
 Per scanned repo, two files live in the repo itself: `KANBAN.canvas`
 (scanner output, ignored by the change detectors) and
-`.todoscope-exclude.csv` (`path,reason` rows; prefix and glob matching).
+`.todoscope-exclude.csv` (`path,reason[,mode]` rows; prefix and glob
+matching; `exclude` skips the path, `hide` scans it and folds its cards
+behind the board's toggle; editable from the board for local repos).
 
 ## Deployment Options
 

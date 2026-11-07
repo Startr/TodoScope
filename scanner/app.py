@@ -242,27 +242,107 @@ def get_webhook_secret(repo_name):
     meta = get_repo_meta(repo_name)
     return meta.get('webhook_secret') if meta else None
 
-def load_exclusions(repo_path):
+SCOPE_FILE = '.todoscope-exclude.csv'
+# exclude — never scanned. hide — scanned, but folded behind the board's
+# "show hidden" toggle. A blank or missing mode column means exclude.
+SCOPE_MODES = ('exclude', 'hide')
+MAX_SCOPE_RULES = 500
+
+
+def load_scope_rules(repo_path):
     """Read .todoscope-exclude.csv from the repo root.
-    Returns list of dicts: [{'path': str, 'reason': str}, ...]
+    Returns list of dicts: [{'path': str, 'reason': str, 'mode': str}, ...]
     Missing or unreadable file silently returns [].
     """
     if not repo_path:
         return []
-    csv_path = os.path.join(repo_path, '.todoscope-exclude.csv')
+    csv_path = os.path.join(repo_path, SCOPE_FILE)
     if not os.path.exists(csv_path):
         return []
-    exclusions = []
+    rules = []
     try:
         with open(csv_path, newline='', encoding='utf-8') as f:
             for row in csv.DictReader(f):
                 p = (row.get('path') or '').strip()
                 r = (row.get('reason') or '').strip()
+                m = (row.get('mode') or '').strip().lower() or 'exclude'
+                if m not in SCOPE_MODES:
+                    app.logger.warning(f"{SCOPE_FILE} in {repo_path}: unknown mode {m!r} for {p!r} — treating as exclude")
+                    m = 'exclude'
                 if p:
-                    exclusions.append({'path': p, 'reason': r})
+                    rules.append({'path': p, 'reason': r, 'mode': m})
     except Exception as e:
-        app.logger.warning(f"Could not read .todoscope-exclude.csv in {repo_path}: {e}")
-    return exclusions
+        app.logger.warning(f"Could not read {SCOPE_FILE} in {repo_path}: {e}")
+    return rules
+
+
+def split_scope(rules):
+    """(exclusions, hidden) — scan-time rules vs view-time rules."""
+    return ([r for r in rules if r['mode'] == 'exclude'],
+            [r for r in rules if r['mode'] == 'hide'])
+
+
+def load_exclusions(repo_path):
+    """Scan-time rules only: the paths the walker must never enter."""
+    return split_scope(load_scope_rules(repo_path))[0]
+
+
+def scope_file_hash(repo_path):
+    """md5 of the raw scope file — the editor's guard against stale writes."""
+    try:
+        with open(os.path.join(repo_path, SCOPE_FILE), 'rb') as f:
+            return hashlib.md5(f.read()).hexdigest()[:12]
+    except OSError:
+        return ''
+
+
+def scope_event(repo_path):
+    """SSE payload describing a repo's scope rules for the board's editor."""
+    return {'type': 'scope', 'rules': load_scope_rules(repo_path),
+            'hash': scope_file_hash(repo_path)}
+
+
+def clean_scope_rules(raw_rules):
+    """Validate rules posted by the scope editor. Returns (rules, error)."""
+    if not isinstance(raw_rules, list):
+        return None, 'rules must be a list'
+    if len(raw_rules) > MAX_SCOPE_RULES:
+        return None, f'At most {MAX_SCOPE_RULES} rules'
+    rules, seen = [], set()
+    for raw in raw_rules:
+        if not isinstance(raw, dict):
+            return None, 'Each rule must be an object'
+        path = str(raw.get('path') or '').strip().replace('\\', '/')
+        while path.startswith('./'):
+            path = path[2:]
+        path = path.rstrip('/')
+        reason = ' '.join(str(raw.get('reason') or '').split())[:300]
+        mode = str(raw.get('mode') or 'exclude').strip().lower()
+        if not path:
+            return None, 'Every rule needs a path'
+        if path.startswith('/') or '..' in path.split('/') or any(ord(c) < 32 for c in path):
+            return None, f'Path must be relative to the repo root: {path}'
+        if mode not in SCOPE_MODES:
+            return None, f'Unknown mode: {mode}'
+        if path in seen:
+            return None, f'Duplicate path: {path}'
+        seen.add(path)
+        rules.append({'path': path, 'reason': reason, 'mode': mode})
+    return rules, None
+
+
+def write_scope_rules(repo_path, rules):
+    """Write rules back to .todoscope-exclude.csv. The mode column appears
+    only when a rule needs it, so exclude-only repos keep a two-column file."""
+    with_mode = any(r['mode'] != 'exclude' for r in rules)
+    target = os.path.join(repo_path, SCOPE_FILE)
+    tmp = target + '.td-tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='') as f:
+        w = csv.writer(f, lineterminator='\n')
+        w.writerow(['path', 'reason', 'mode'] if with_mode else ['path', 'reason'])
+        for r in rules:
+            w.writerow([r['path'], r['reason'], r['mode']] if with_mode else [r['path'], r['reason']])
+    os.replace(tmp, target)
 
 
 def is_excluded(rel_path, exclusions):
@@ -957,7 +1037,9 @@ def save_scan_state(repo_name, state):
 
 
 def exclusions_hash(exclusions):
-    """Stable md5 over sorted (path, reason) tuples — None-safe."""
+    """Stable md5 over sorted (path, reason) tuples — None-safe.
+    Callers pass exclude-mode rules only: hide rules change the view,
+    not what is scanned, so editing them never forces a full rescan."""
     items = sorted((e.get('path', ''), e.get('reason', '')) for e in (exclusions or []))
     return hashlib.md5(repr(items).encode()).hexdigest()[:12]
 
@@ -1437,8 +1519,8 @@ def stream_data(repo_url):
                 repo_name = os.path.basename(os.path.normpath(existing_path))
                 origin_url = get_repo_origin_url(existing_path) or repo_url
 
-                # Load exclusions before the first scan so the fast TODO.md pass is filtered too
-                exclusions = load_exclusions(existing_path)
+                # Load scope rules before the first scan so the fast TODO.md pass is filtered too
+                exclusions, hidden = split_scope(load_scope_rules(existing_path))
 
                 # Send repo metadata and TODO.md immediately — no waiting
                 branch = get_repo_branch(existing_path)
@@ -1467,15 +1549,16 @@ def stream_data(repo_url):
                 if repo_url in load_local_repos() and viewer_authed:
                     init_payload['local_path'] = existing_path
                 yield f"data: {json.dumps(init_payload)}\n\n"
+                yield f"data: {json.dumps(scope_event(existing_path))}\n\n"
                 # Instant-load: render the previous board (marked stale) while the scan runs
                 if cached_canvas:
                     prev_state = load_scan_state(repo_name)
                     stale_html = fragments.render_kanban_html(
-                        cached_canvas, (prev_state or {}).get('blame'), stale=True)
+                        cached_canvas, (prev_state or {}).get('blame'), stale=True, hidden=hidden)
                     yield f"data: {json.dumps({'type': 'kanban', 'html': stale_html})}\n\n"
                 todo_md_files = find_todo_files(existing_path, exclusions=exclusions, skipped=skipped)
                 if todo_md_files:
-                    md_html = fragments.render_todo_md_files_html(todo_md_files)
+                    md_html = fragments.render_todo_md_files_html(todo_md_files, hidden=hidden)
                     yield f"data: {json.dumps({'type': 'todo_md_files', 'count': len(todo_md_files), 'html': md_html})}\n\n"
 
                 if repo_url in load_local_repos():
@@ -1487,15 +1570,16 @@ def stream_data(repo_url):
                     # behind it and let the fresh fragments morph in changes.
                     yield f"data: {json.dumps({'type': 'status', 'message': 'Checking for new commits...'})}\n\n"
                     repo_path = clone_repository(repo_url, shallow=shallow)
-                    # Reload exclusions in case the pull updated .todoscope-exclude.csv
-                    exclusions = load_exclusions(repo_path)
+                    # Reload scope rules in case the pull updated .todoscope-exclude.csv
+                    exclusions, hidden = split_scope(load_scope_rules(repo_path))
+                    yield f"data: {json.dumps(scope_event(repo_path))}\n\n"
             else:
                 # New repo — must clone first
                 yield f"data: {json.dumps({'type': 'status', 'message': 'Cloning repository...'})}\n\n"
                 repo_path = clone_repository(repo_url, shallow=shallow)
                 repo_name = os.path.basename(repo_path)
                 origin_url = get_repo_origin_url(repo_path) or repo_url
-                exclusions = load_exclusions(repo_path)
+                exclusions, hidden = split_scope(load_scope_rules(repo_path))
 
                 branch = get_repo_branch(repo_path)
                 parts = parse_git_origin(origin_url)
@@ -1508,9 +1592,10 @@ def stream_data(repo_url):
                     'web_file_url_template': build_web_file_url_template(parts, branch or 'HEAD'),
                 }
                 yield f"data: {json.dumps(init_payload)}\n\n"
+                yield f"data: {json.dumps(scope_event(repo_path))}\n\n"
                 todo_md_files = find_todo_files(repo_path, exclusions=exclusions, skipped=skipped)
                 if todo_md_files:
-                    md_html = fragments.render_todo_md_files_html(todo_md_files)
+                    md_html = fragments.render_todo_md_files_html(todo_md_files, hidden=hidden)
                     yield f"data: {json.dumps({'type': 'todo_md_files', 'count': len(todo_md_files), 'html': md_html})}\n\n"
 
             # --- Decide incremental vs full scan ---
@@ -1548,9 +1633,9 @@ def stream_data(repo_url):
                 canvas, _cards = build_kanban(todo_md_files, todos_collected)
                 md_sources = {f['file_path']: f['content'] for f in todo_md_files if f.get('content')}
                 todos_html = fragments.render_todos_list_html(
-                    [t.to_dict() for t in todos_collected], blame_data)
+                    [t.to_dict() for t in todos_collected], blame_data, hidden=hidden)
                 yield f"data: {json.dumps({'type': 'todos_list', 'count': todo_count, 'html': todos_html})}\n\n"
-                yield f"data: {json.dumps({'type': 'kanban', 'html': fragments.render_kanban_html(canvas, blame_data, md_sources=md_sources)})}\n\n"
+                yield f"data: {json.dumps({'type': 'kanban', 'html': fragments.render_kanban_html(canvas, blame_data, md_sources=md_sources, hidden=hidden)})}\n\n"
                 source = 'local' if repo_url in load_local_repos() else 'cloned'
                 yield f"data: {json.dumps({'type': 'complete', 'count': todo_count, 'repo_name': repo_name, 'source': source})}\n\n"
                 return
@@ -1571,7 +1656,7 @@ def stream_data(repo_url):
                         todo = TodoItem(rel_path, item['line_num'], item['todo_text'], item['next_line'])
                         todo_count += 1
                         todos_collected.append(todo)
-                todos_html = fragments.render_todos_list_html([t.to_dict() for t in todos_collected])
+                todos_html = fragments.render_todos_list_html([t.to_dict() for t in todos_collected], hidden=hidden)
                 yield f"data: {json.dumps({'type': 'todos_list', 'count': todo_count, 'html': todos_html})}\n\n"
             else:
                 # --- Full-scan path (today's behavior) ---
@@ -1579,7 +1664,7 @@ def stream_data(repo_url):
                 for todo in find_todos(repo_path, exclusions=exclusions, skipped=skipped):
                     todo_count += 1
                     todos_collected.append(todo)
-                    yield f"data: {json.dumps({'type': 'todo', 'count': todo_count, 'html': fragments.render_todo_item_html(todo.to_dict())})}\n\n"
+                    yield f"data: {json.dumps({'type': 'todo', 'count': todo_count, 'html': fragments.render_todo_item_html(todo.to_dict(), hidden=hidden)})}\n\n"
 
             # Report excluded paths before completion so the client can render them
             if skipped:
@@ -1591,15 +1676,15 @@ def stream_data(repo_url):
             canvas, cards = build_kanban(todo_md_files, todos_collected)
             write_canvas(repo_path, canvas)
             md_sources = {f['file_path']: f['content'] for f in todo_md_files if f.get('content')}
-            yield f"data: {json.dumps({'type': 'kanban', 'html': fragments.render_kanban_html(canvas, md_sources=md_sources)})}\n\n"
+            yield f"data: {json.dumps({'type': 'kanban', 'html': fragments.render_kanban_html(canvas, md_sources=md_sources, hidden=hidden)})}\n\n"
 
             # Git blame attribution — runs after kanban so the board appears immediately.
             # Best-effort: blame failure never blocks the scan.
             blame_data = collect_blame_data(repo_path, cards)
             if blame_data:
-                yield f"data: {json.dumps({'type': 'kanban', 'html': fragments.render_kanban_html(canvas, blame_data, md_sources=md_sources)})}\n\n"
+                yield f"data: {json.dumps({'type': 'kanban', 'html': fragments.render_kanban_html(canvas, blame_data, md_sources=md_sources, hidden=hidden)})}\n\n"
                 todos_html = fragments.render_todos_list_html(
-                    [t.to_dict() for t in todos_collected], blame_data)
+                    [t.to_dict() for t in todos_collected], blame_data, hidden=hidden)
                 yield f"data: {json.dumps({'type': 'todos_list', 'count': todo_count, 'html': todos_html})}\n\n"
 
             # Persist scan state for next-time incremental scan. Best-effort —
@@ -1797,6 +1882,33 @@ def api_todo_toggle(repo_name):
         f.writelines(lines)
     os.replace(tmp, target)
     return jsonify({'ok': True, 'line': line_num, 'checked': checked})
+
+
+@app.route('/api/scope/<path:repo_name>', methods=['POST'])
+def api_scope(repo_name):
+    """Replace a repo's .todoscope-exclude.csv from the board's scope editor.
+
+    Local repos only, like checkbox write-back. Guarded by a hash of the
+    file the viewer loaded, so an edit made elsewhere is never clobbered —
+    stale writes get 409 with the current rules. The write triggers the
+    watchdog, which rescans and pushes fresh fragments to every subscriber.
+    """
+    local_repos = load_local_repos()
+    if repo_name not in local_repos:
+        return jsonify({'error': 'Scope editing is only available for registered local repositories'}), 403
+    repo_path = local_repos[repo_name]['path']
+
+    data = request.get_json(silent=True) or {}
+    if (data.get('base_hash') or '') != scope_file_hash(repo_path):
+        return jsonify({'error': f'{SCOPE_FILE} changed since you loaded it', **scope_event(repo_path)}), 409
+    rules, error = clean_scope_rules(data.get('rules'))
+    if error:
+        return jsonify({'error': error}), 400
+    try:
+        write_scope_rules(repo_path, rules)
+    except OSError as e:
+        return jsonify({'error': f'Cannot write {SCOPE_FILE}: {e}'}), 500
+    return jsonify({'ok': True, **scope_event(repo_path)})
 
 
 @app.route('/api/todo_files/<path:repo_name>')
